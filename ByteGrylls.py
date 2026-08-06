@@ -42,18 +42,34 @@ class ByteGrylls:
     @staticmethod
     def netcat_listen(host: str, port: int):
         """Opens a local TCP socket and listens for incoming connections (Netcat server mode)."""
-        print(f"[*] Binding TCP socket listener on {host}:{port}...")
+        print(f"[*] Binding TCP socket listener on {host}:{port}...", flush=True)
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((host, port))
-                s.listen(1)
-                print("[+] Listening for incoming connections... (Press Ctrl+C to abort)")
-                conn, addr = s.accept()
-                with conn:
-                    print(f"[+] Incoming connection established from {addr[0]}:{addr[1]}")
-                    data = conn.recv(1024)
-                    print(f"[Received Data]: {data.decode(errors='replace')}")
+                s.listen(5)
+                # Short timeout allows Python to intercept KeyboardInterrupt on PowerShell/Windows
+                s.settimeout(1.0)
+                print("[+] Listening for incoming connections... (Press Ctrl+C to abort)", flush=True)
+
+                while True:
+                    try:
+                        conn, addr = s.accept()
+                    except socket.timeout:
+                        continue
+
+                    print(f"[+] Incoming connection established from {addr[0]}:{addr[1]}", flush=True)
+                    try:
+                        conn.settimeout(5.0)
+                        data = conn.recv(1024)
+                        if data:
+                            print(f"[Received Data]: {data.decode(errors='replace')}", flush=True)
+                        else:
+                            print(f"[*] Connection from {addr[0]}:{addr[1]} closed with no data.", flush=True)
+                    except socket.timeout:
+                        print(f"[-] No data received from {addr[0]}:{addr[1]} within timeout.", flush=True)
+                    finally:
+                        conn.close()
         except KeyboardInterrupt:
             print("\n[*] Listener stopped by user.")
         except Exception as e:
@@ -236,6 +252,11 @@ class ByteGrylls:
 # --- CLI INTERFACE WITH CONTEXTUAL HELP ---
 
 def main():
+    # Force line-buffered stdout so log lines (e.g. "listen" connections) appear
+    # immediately instead of waiting on Python's block-buffering in PowerShell/Windows.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(
         prog="ByteGrylls",
         description="ByteGrylls: Survival-ready pure Python network diagnostic tool (Zero external dependencies).",
