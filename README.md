@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ByteGryllsLogo.png" alt="ByteGrylls logo" width="260">
+  <img src="ByteGryllsLogo.png" alt="ByteGrylls logo" width="480">
 </p>
 
 # ByteGrylls
