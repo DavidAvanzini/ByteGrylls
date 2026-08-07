@@ -261,11 +261,11 @@ def main():
         prog="ByteGrylls",
         description="ByteGrylls: Survival-ready pure Python network diagnostic tool (Zero external dependencies).",
         epilog="Examples:\n"
-               "  python3 byte_grylls.py nc 1.1.1.1 80\n"
-               "  python3 byte_grylls.py listen 0.0.0.0 4444\n"
-               "  python3 byte_grylls.py dns example.com --server 8.8.8.8\n"
-               "  sudo python3 byte_grylls.py ping google.com -c 5\n"
-               "  sudo python3 byte_grylls.py traceroute 8.8.8.8 -m 15\n",
+               "  python3 ByteGrylls.py nc 1.1.1.1 80\n"
+               "  python3 ByteGrylls.py listen 0.0.0.0 4444\n"
+               "  python3 ByteGrylls.py dns example.com --server 8.8.8.8\n"
+               "  sudo python3 ByteGrylls.py ping google.com -c 5\n"
+               "  sudo python3 ByteGrylls.py traceroute 8.8.8.8 -m 15\n",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
