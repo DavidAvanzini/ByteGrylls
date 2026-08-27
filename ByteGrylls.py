@@ -265,7 +265,8 @@ def main():
                "  python3 ByteGrylls.py listen 0.0.0.0 4444\n"
                "  python3 ByteGrylls.py dns example.com --server 8.8.8.8\n"
                "  sudo python3 ByteGrylls.py ping google.com -c 5\n"
-               "  sudo python3 ByteGrylls.py traceroute 8.8.8.8 -m 15\n",
+               "  sudo python3 ByteGrylls.py traceroute 8.8.8.8 -m 15\n\n"
+               "Author: David Avanzini\n",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
