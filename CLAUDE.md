@@ -27,12 +27,23 @@ unless run elevated (`sudo` on Linux/macOS, Administrator PowerShell/CMD on Wind
 `listen`, and `dns` are unprivileged. `nc`/`listen` ports are validated to 1-65535 by argparse
 (`_valid_port`) before any socket call.
 
-There is no linter, formatter, or test suite configured in this repo. Verify changes by running
-the relevant subcommand manually (e.g. `python3 ByteGrylls.py nc 1.1.1.1 443`). When touching
-`ping`/`traceroute`, note that some virtualized/NAT'd networks silently drop ICMP Time Exceeded
-replies — if `traceroute` times out on every hop but `ping` to the same host succeeds, that's very
-likely the network, not the code; confirm with a minimal raw-socket script before assuming a
-regression.
+There is no linter or formatter configured in this repo. Unit tests live in
+[test_bytegrylls.py](test_bytegrylls.py) (stdlib `unittest`, no dependencies):
+
+```bash
+python -m unittest test_bytegrylls -v
+```
+
+`ping`/`traceroute`/`dns_query` are tested by monkeypatching `socket.socket` (and `select.select`
+for the ICMP tests) inside the `ByteGrylls` module, so the suite needs no root/Administrator
+privileges and never touches the real network or binds a real raw socket — see `FakeIcmpSocket`,
+`PairedSocketFactory`, and `fake_select_for()` in the test file if extending this coverage.
+`nc`/`listen` are tested against real loopback sockets on ephemeral ports instead, since that
+needs no elevation either. When touching `ping`/`traceroute` manually against a live host, note
+that some virtualized/NAT'd networks silently drop ICMP Time Exceeded replies, and some drop RST
+on closed loopback ports — if `traceroute` times out on every hop but `ping` to the same host
+succeeds, or a "connection refused" test times out instead, that's very likely the network, not
+the code.
 
 ## Architecture
 
