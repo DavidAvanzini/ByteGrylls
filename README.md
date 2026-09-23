@@ -6,9 +6,10 @@
 
 **Survival-ready pure Python network diagnostic tool. Zero external dependencies.**
 
-ByteGrylls reimplements the everyday basics of `nc`, `dig`/`nslookup`, `ping`, and `traceroute`
-using nothing but the Python 3 standard library. One `.py` file, no `pip install`, no compiler,
-no admin rights to *set up* (some commands still need elevated privileges to *run*, see below).
+ByteGrylls reimplements the everyday basics of `nc`, `dig`/`nslookup`, `ping`, `traceroute`, and a
+port scanner using nothing but the Python 3 standard library. One `.py` file, no `pip install`, no
+compiler, no admin rights to *set up* (some commands still need elevated privileges to *run*, see
+below).
 
 ## Why
 
@@ -297,14 +298,16 @@ so it isn't mistaken for a normal hop:
 
 ## Testing
 
-Unit tests ([test_bytegrylls.py](test_bytegrylls.py)) use only the standard library `unittest`
-module — nothing to install:
+Unit tests ([test_bytegrylls.py](test_bytegrylls.py), ~60 of them) use only the standard library
+`unittest` module — nothing to install:
 
 ```bash
 python -m unittest test_bytegrylls -v
 ```
 
-The `ping`/`traceroute`/`dns` tests run against mocked sockets, so the suite needs no root/
+Every subcommand is covered, including `ping`/`traceroute` in both IPv4 and IPv6, and `main()`'s
+own argument parsing/dispatch. The `ping`/`traceroute`/`dns` tests run against mocked sockets and
+`netcat_listen()` is tested against a real loopback socket, so the suite needs no root/
 Administrator privileges and never touches the real network.
 
 ## Full help
