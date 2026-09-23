@@ -33,7 +33,7 @@ already sitting there.
 - Works on Linux, macOS, and Windows (CMD or PowerShell)
 - `ping` and `traceroute` build raw ICMP sockets, so those two subcommands need elevated
   privileges: `sudo` on Linux/macOS, an **Administrator** PowerShell/CMD on Windows. `nc`,
-  `listen`, and `dns` are unprivileged and work as a normal user everywhere.
+  `listen`, `dns`, and `scan` are unprivileged and work as a normal user everywhere.
 
 ## Getting it onto the target machine
 
@@ -63,9 +63,10 @@ Running it with no arguments prints the full help.
 
 | Command      | What it does                                        | Privileges needed          |
 |--------------|------------------------------------------------------|-----------------------------|
-| `nc`         | Test whether a TCP port is open, optionally send data | None                        |
-| `listen`     | Open a local TCP listener (server mode)               | None                        |
-| `dns`        | Resolve an A or AAAA record via raw UDP DNS query      | None                        |
+| `nc`         | Test whether a TCP/UDP port is open, optionally send data | None                   |
+| `listen`     | Open a local TCP/UDP listener (server mode)            | None                        |
+| `dns`        | Resolve an A, AAAA, or PTR record via raw UDP DNS query | None                       |
+| `scan`       | Sweep a range of TCP ports on a host                   | None                        |
 | `ping`       | Send raw ICMP Echo Requests (IPv4 or IPv6)             | root/sudo or Administrator  |
 | `traceroute` | Trace the route to a host via increasing TTL (IPv4/IPv6) | root/sudo or Administrator |
 
@@ -103,6 +104,23 @@ echo "hello" | python3 ByteGrylls.py nc 127.0.0.1 4444
 Flags:
 - `-t / --timeout` — connection timeout in seconds (default `3.0`)
 - `-d / --data` — literal text to send after connecting (falls back to piped stdin if omitted)
+- `-u / --udp` — use UDP instead of TCP
+
+With `-u`, there's no handshake to confirm the port is open — UDP has none. ByteGrylls sends the
+datagram, then waits `--timeout` for either a reply (the port is definitely open) or an ICMP Port
+Unreachable surfaced by the OS as a connection error (the port is definitely closed). A plain
+timeout with neither means "open or filtered" — indistinguishable without an application-level
+reply:
+
+```bash
+python3 ByteGrylls.py nc 8.8.8.8 53 -u -d "probe"
+```
+
+```
+[*] Sending UDP datagram to 8.8.8.8:53...
+[+] Sent 5 byte(s) to 8.8.8.8:53 in 12.31 ms
+[*] No reply received (UDP is connectionless - open and filtered ports look identical without one).
+```
 
 ---
 
@@ -132,9 +150,16 @@ python3 ByteGrylls.py listen 4444              # binds 0.0.0.0:4444
 python3 ByteGrylls.py listen 127.0.0.1 4444     # binds loopback only
 ```
 
+Add `-u / --udp` to bind a UDP socket instead — useful for catching UDP-based callbacks or
+testing a UDP firewall rule:
+
+```bash
+python3 ByteGrylls.py listen 0.0.0.0 5353 -u
+```
+
 ---
 
-### `dns` — raw UDP A/AAAA lookup
+### `dns` — raw UDP A/AAAA/PTR lookup
 
 Handy when you want to query a *specific* resolver directly (bypassing whatever the OS is
 configured to use) and `dig`/`nslookup` aren't installed.
@@ -154,6 +179,46 @@ Flags:
 - `-s / --server` — DNS server to query (default `8.8.8.8`)
 - `-t / --timeout` — query timeout in seconds (default `3.0`)
 - `-6 / --ipv6` — query the AAAA record instead of A
+- `-x / --reverse` — reverse lookup: treat the argument as an IPv4/IPv6 address and query its PTR
+  record instead
+
+```bash
+python3 ByteGrylls.py dns 8.8.8.8 -x
+```
+
+```
+[*] Querying DNS record PTR for '8.8.8.8' (8.8.8.8.in-addr.arpa) via server 8.8.8.8...
+[+] Resolved: 8.8.8.8 -> dns.google (32.95 ms)
+```
+
+---
+
+### `scan` — sweep a range of TCP ports
+
+A lightweight, unprivileged port sweep built on the same `socket.create_connection` logic as
+`nc`, run concurrently across a thread pool so a wide range doesn't take forever.
+
+```bash
+python3 ByteGrylls.py scan 10.0.0.5 22,80,443
+python3 ByteGrylls.py scan 10.0.0.5 1-1024 -t 0.5
+```
+
+```
+[*] Scanning TCP 10.0.0.5 across 3 port(s)...
+[+] 22/tcp open
+[+] 443/tcp open
+
+[*] Scan complete: 2/3 open -> 22, 443
+```
+
+Flags:
+- `ports` — a comma-separated list and/or dash ranges, e.g. `22,80,443` or `1-1024` or `22,1000-1010`
+- `-t / --timeout` — per-port connection timeout in seconds (default `1.0`)
+- `-w / --workers` — maximum concurrent probes (default `100`)
+
+A wide range (e.g. `1-65535`) against a host that silently drops probes on every closed/filtered
+port will still take roughly `timeout × ports ÷ workers` to finish — lower `-t` or raise `-w` if
+that's too slow for your case.
 
 ---
 

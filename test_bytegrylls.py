@@ -23,11 +23,11 @@ import unittest
 from unittest import mock
 
 import ByteGrylls as bg
-from ByteGrylls import ByteGrylls, _valid_port
+from ByteGrylls import ByteGrylls, _valid_port, _parse_ports
 
 
 def _icmp_header(icmp_type, icmp_id, seq, checksum=0):
-    return struct.pack("bbHHh", icmp_type, 0, checksum, icmp_id, seq)
+    return struct.pack("BBHHh", icmp_type, 0, checksum, icmp_id, seq)
 
 
 def _icmp_payload():
@@ -179,14 +179,14 @@ class TestDnsQuery(unittest.TestCase):
 
     TXN_ID = b"\x12\x34"  # dns_query() hardcodes transaction_id = 0x1234
 
-    def _run_query(self, response_bytes, record_type="A"):
+    def _run_query(self, response_bytes, record_type="A", query_input="example.com"):
         fake = mock.Mock()
         fake.recvfrom.return_value = (response_bytes, ("8.8.8.8", 53))
         fake.__enter__ = mock.Mock(return_value=fake)
         fake.__exit__ = mock.Mock(return_value=False)
         with mock.patch("ByteGrylls.socket.socket", return_value=fake):
             with captured_stdout() as out:
-                result = ByteGrylls.dns_query("example.com", record_type=record_type)
+                result = ByteGrylls.dns_query(query_input, record_type=record_type)
         return result, out.getvalue()
 
     def _rr(self, name_ptr_offset, rtype, rdata, ttl=60):
@@ -196,10 +196,10 @@ class TestDnsQuery(unittest.TestCase):
             + rdata
         )
 
-    def _header_and_question(self, ancount):
+    def _header_and_question(self, ancount, qname_str="example.com", qtype=1):
         header = self.TXN_ID + struct.pack("!HHHHH", 0x8180, 1, ancount, 0, 0)
-        qname = b"\x07example\x03com\x00"
-        question = qname + struct.pack("!H", 1) + struct.pack("!H", 1)
+        qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in qname_str.split(".")) + b"\x00"
+        question = qname + struct.pack("!H", qtype) + struct.pack("!H", 1)
         return header + question, 12  # question name starts at offset 12
 
     def test_resolves_simple_a_record(self):
@@ -252,6 +252,43 @@ class TestDnsQuery(unittest.TestCase):
         result, output = self._run_query(response)
         self.assertIsNone(result)
         self.assertIn("did not match the query", output)
+
+    def test_resolves_ptr_record(self):
+        base, qoffset = self._header_and_question(ancount=1, qname_str="7.2.0.192.in-addr.arpa", qtype=12)
+        ptr_name = b"\x04host\x07example\x03com\x00"
+        response = base + self._rr(qoffset, rtype=12, rdata=ptr_name)
+        result, output = self._run_query(response, record_type="PTR", query_input="192.0.2.7")
+        self.assertEqual(result, "host.example.com")
+        self.assertIn("Resolved", output)
+
+    def test_ptr_query_with_invalid_ip_fails_cleanly(self):
+        # Regression test: _reverse_dns_name() used to be called before the try/except, so a
+        # non-IP argument to `dns -x` raised an uncaught OSError instead of a normal [-] message.
+        with captured_stdout() as out:
+            result = ByteGrylls.dns_query("not-an-ip-address", record_type="PTR")
+        self.assertIsNone(result)
+        self.assertIn("not a valid IPv4 or IPv6 address", out.getvalue())
+
+    def test_query_timeout_reported_cleanly(self):
+        fake = mock.Mock()
+        fake.recvfrom.side_effect = socket.timeout("timed out")
+        fake.__enter__ = mock.Mock(return_value=fake)
+        fake.__exit__ = mock.Mock(return_value=False)
+        with mock.patch("ByteGrylls.socket.socket", return_value=fake):
+            with captured_stdout() as out:
+                result = ByteGrylls.dns_query("example.com")
+        self.assertIsNone(result)
+        self.assertIn("DNS Query failed", out.getvalue())
+
+
+class TestReverseDnsName(unittest.TestCase):
+    def test_ipv4(self):
+        self.assertEqual(ByteGrylls._reverse_dns_name("192.0.2.7"), "7.2.0.192.in-addr.arpa")
+
+    def test_ipv6(self):
+        # RFC 3596's own worked example for 2001:db8::1.
+        expected = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"
+        self.assertEqual(ByteGrylls._reverse_dns_name("2001:db8::1"), expected)
 
 
 class TestResolve(unittest.TestCase):
@@ -327,6 +364,59 @@ class TestPingMatching(unittest.TestCase):
                 self.tool.ping("192.0.2.1", count=2, timeout=2.0)
         self.assertEqual(socket_ctor.call_count, 1)
 
+    def test_permission_error_reports_cleanly(self):
+        with mock.patch("ByteGrylls.socket.socket", side_effect=PermissionError("raw sockets need admin")):
+            with captured_stdout() as out:
+                self.tool.ping("192.0.2.1", count=2, timeout=2.0)
+        self.assertIn("PERMISSION ERROR", out.getvalue())
+        # No packets ever left the (nonexistent) socket, so there's nothing to summarize.
+        self.assertNotIn("packets transmitted", out.getvalue())
+
+
+class TestPingIPv6(unittest.TestCase):
+    """The is_ipv6 branch: no outer IP header on the wire, type 128/129, kernel-filled checksum."""
+
+    def setUp(self):
+        self.icmp_id = os.getpid() & 0xFFFF
+        self.tool = ByteGrylls()
+
+    def _run_ping(self, packets, timeout=2.0):
+        fake = FakeIcmpSocket(packets)
+        # prefer_ipv6=True makes _resolve() try AF_INET6 first, matching this mock (which
+        # doesn't discriminate by the requested family, so an IPv4-first attempt would also
+        # "succeed" and silently defeat the point of these IPv6-path tests).
+        with mock.patch("ByteGrylls.socket.getaddrinfo",
+                         return_value=[(socket.AF_INET6, None, None, None, ("2001:db8::1", 0, 0, 0))]), \
+             mock.patch("ByteGrylls.socket.socket", return_value=fake), \
+             mock.patch("ByteGrylls.select.select", side_effect=fake_select_for(fake)):
+            with captured_stdout() as out:
+                self.tool.ping("v6host.example.com", count=1, timeout=timeout, prefer_ipv6=True)
+        return fake, out.getvalue()
+
+    def test_matches_ipv6_echo_reply(self):
+        packets = [(build_echo_reply(129, self.icmp_id, 1, ipv6=True), ("2001:db8::1", 0, 0, 0))]
+        fake, output = self._run_ping(packets)
+        self.assertIn("icmp_seq=1", output)
+        # ICMPv6 checksums are left for the kernel to fill in, unlike ICMPv4's hand-computed one.
+        sent_header = fake.sent[0][0][:8]
+        _, _, sent_checksum, _, _ = struct.unpack("BBHHh", sent_header)
+        self.assertEqual(sent_checksum, 0)
+
+    def test_reports_when_platform_lacks_icmpv6(self):
+        with mock.patch("ByteGrylls.socket.getaddrinfo",
+                         return_value=[(socket.AF_INET6, None, None, None, ("2001:db8::1", 0, 0, 0))]):
+            had_attr = hasattr(socket, "IPPROTO_ICMPV6")
+            saved = getattr(socket, "IPPROTO_ICMPV6", None)
+            if had_attr:
+                del socket.IPPROTO_ICMPV6
+            try:
+                with captured_stdout() as out:
+                    self.tool.ping("v6host.example.com", count=1, timeout=1.0, prefer_ipv6=True)
+            finally:
+                if had_attr:
+                    socket.IPPROTO_ICMPV6 = saved
+        self.assertIn("not supported", out.getvalue())
+
 
 class TestTracerouteMatching(unittest.TestCase):
     def setUp(self):
@@ -363,6 +453,53 @@ class TestTracerouteMatching(unittest.TestCase):
     def test_hop_with_no_reply_prints_timeout(self):
         output = self._run_traceroute([[]], timeout=0.05)
         self.assertIn(" 1  * * * (Request Timed Out)", output)
+
+    def test_permission_error_reports_cleanly(self):
+        with mock.patch("ByteGrylls.socket.socket", side_effect=PermissionError("raw sockets need admin")):
+            with captured_stdout() as out:
+                self.tool.traceroute("192.0.2.1", max_hops=3, timeout=1.0)
+        self.assertIn("PERMISSION ERROR", out.getvalue())
+
+
+class TestTracerouteIPv6(unittest.TestCase):
+    """The is_ipv6 branch: no outer IP header, type 128/129/3/1, fixed 40-byte inner IPv6 header."""
+
+    def setUp(self):
+        self.icmp_id = os.getpid() & 0xFFFF
+        self.tool = ByteGrylls()
+
+    def _run_traceroute(self, per_hop_packets, timeout=2.0):
+        factory = PairedSocketFactory(per_hop_packets)
+        with mock.patch("ByteGrylls.socket.getaddrinfo",
+                         return_value=[(socket.AF_INET6, None, None, None, ("2001:db8::1", 0, 0, 0))]), \
+             mock.patch("ByteGrylls.socket.socket", side_effect=factory), \
+             mock.patch("ByteGrylls.select.select",
+                         side_effect=lambda rlist, w, x, t, f=factory: fake_select_for(f._current)(rlist, w, x, t)):
+            with captured_stdout() as out:
+                self.tool.traceroute("v6host.example.com", max_hops=len(per_hop_packets), timeout=timeout,
+                                      prefer_ipv6=True)
+        return out.getvalue()
+
+    def test_matches_ipv6_time_exceeded_then_reaches_target(self):
+        # ICMPv6 Time Exceeded is type 3 (ICMPv4 uses 11) - see traceroute()'s per-family branch.
+        hop1 = [(build_time_exceeded(self.icmp_id, 1, icmp_type=3, ipv6=True), ("2001:db8::fe", 0, 0, 0))]
+        hop2 = [(build_echo_reply(129, self.icmp_id, 2, ipv6=True), ("2001:db8::1", 0, 0, 0))]
+        output = self._run_traceroute([hop1, hop2])
+        self.assertIn("2001:db8::fe", output)
+        self.assertIn("2001:db8::1", output)
+        self.assertIn("Target reached successfully!", output)
+
+    def test_reports_when_platform_lacks_icmpv6(self):
+        with mock.patch("ByteGrylls.socket.getaddrinfo",
+                         return_value=[(socket.AF_INET6, None, None, None, ("2001:db8::1", 0, 0, 0))]):
+            saved = socket.IPV6_UNICAST_HOPS
+            del socket.IPV6_UNICAST_HOPS
+            try:
+                with captured_stdout() as out:
+                    self.tool.traceroute("v6host.example.com", max_hops=1, timeout=1.0, prefer_ipv6=True)
+            finally:
+                socket.IPV6_UNICAST_HOPS = saved
+        self.assertIn("not supported", out.getvalue())
 
 
 class TestNetcat(unittest.TestCase):
@@ -416,6 +553,240 @@ class TestNetcat(unittest.TestCase):
             ok = ByteGrylls.netcat_client("127.0.0.1", port, timeout=0.5)
         self.assertFalse(ok)
         self.assertIn("[-]", out.getvalue())
+
+
+class TestNetcatUdp(unittest.TestCase):
+    def test_client_sends_datagram_to_listener(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.settimeout(3.0)
+
+        received = []
+
+        def recv_once():
+            data, _ = srv.recvfrom(1024)
+            received.append(data)
+            srv.close()
+
+        thread = threading.Thread(target=recv_once, daemon=True)
+        thread.start()
+        time.sleep(0.1)  # let the listener start receiving
+
+        with captured_stdout() as out:
+            ok = ByteGrylls.netcat_client("127.0.0.1", port, timeout=0.3, data=b"hello-udp", udp=True)
+        thread.join(timeout=3.0)
+
+        self.assertTrue(ok)
+        self.assertEqual(received, [b"hello-udp"])
+        self.assertIn("Sent 9 byte", out.getvalue())
+
+    def test_closed_port_reports_failure_or_no_reply(self):
+        # UDP is connectionless: whether a closed port surfaces as an ICMP-driven connection
+        # error or a plain timeout depends on the host's network stack, so accept either -
+        # same tolerance TestNetcat.test_unreachable_port_reports_failure uses for TCP.
+        srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.close()
+
+        with captured_stdout() as out:
+            ok = ByteGrylls.netcat_client("127.0.0.1", port, timeout=0.5, data=b"probe", udp=True)
+        output = out.getvalue()
+        if ok:
+            self.assertIn("No reply received", output)
+        else:
+            self.assertIn("appears closed", output)
+
+
+def _wait_for(buf, needle, timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if needle in buf.getvalue():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"timed out waiting for {needle!r} in captured output")
+
+
+class TestNetcatListen(unittest.TestCase):
+    """Exercises netcat_listen() itself (not just a hand-rolled stand-in server)."""
+
+    def _free_port(self, sock_type):
+        probe = socket.socket(socket.AF_INET, sock_type)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    def test_tcp_listener_logs_received_data(self):
+        port = self._free_port(socket.SOCK_STREAM)
+        with captured_stdout() as out:
+            thread = threading.Thread(target=ByteGrylls.netcat_listen, args=("127.0.0.1", port), daemon=True)
+            thread.start()
+            _wait_for(out, "Listening for incoming connections")
+
+            with socket.create_connection(("127.0.0.1", port), timeout=2.0) as client:
+                client.sendall(b"hi-tcp-listener")
+
+            _wait_for(out, "Received Data")
+
+        output = out.getvalue()
+        self.assertIn("Incoming connection established", output)
+        self.assertIn("hi-tcp-listener", output)
+
+    def test_tcp_listener_reports_empty_connection(self):
+        port = self._free_port(socket.SOCK_STREAM)
+        with captured_stdout() as out:
+            thread = threading.Thread(target=ByteGrylls.netcat_listen, args=("127.0.0.1", port), daemon=True)
+            thread.start()
+            _wait_for(out, "Listening for incoming connections")
+
+            socket.create_connection(("127.0.0.1", port), timeout=2.0).close()
+
+            _wait_for(out, "closed with no data")
+
+        self.assertIn("closed with no data", out.getvalue())
+
+    def test_udp_listener_logs_received_datagram(self):
+        port = self._free_port(socket.SOCK_DGRAM)
+        with captured_stdout() as out:
+            thread = threading.Thread(
+                target=ByteGrylls.netcat_listen, args=("127.0.0.1", port), kwargs={"udp": True}, daemon=True
+            )
+            thread.start()
+            _wait_for(out, "Listening for incoming datagrams")
+
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.sendto(b"hi-udp-listener", ("127.0.0.1", port))
+
+            _wait_for(out, "Received Data")
+
+        output = out.getvalue()
+        self.assertIn("Datagram received", output)
+        self.assertIn("hi-udp-listener", output)
+
+
+class TestMainCli(unittest.TestCase):
+    """Exercises main()'s argparse wiring end-to-end: flags -> the method args each command gets."""
+
+    def _run_main(self, argv):
+        with mock.patch.object(bg.sys, "argv", ["ByteGrylls.py"] + argv), \
+             mock.patch.object(bg.sys.stdin, "isatty", return_value=True):
+            bg.main()
+
+    def test_version_flag_prints_and_exits_cleanly(self):
+        with captured_stdout() as out, self.assertRaises(SystemExit) as ctx:
+            self._run_main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn(bg.__version__, out.getvalue())
+
+    def test_no_args_prints_help_and_exits_cleanly(self):
+        with captured_stdout() as out, self.assertRaises(SystemExit) as ctx:
+            self._run_main([])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("usage", out.getvalue().lower())
+
+    def test_nc_dispatches_parsed_args(self):
+        with mock.patch.object(bg.ByteGrylls, "netcat_client") as mocked:
+            self._run_main(["nc", "example.com", "443", "-t", "1.5", "-d", "hello"])
+        mocked.assert_called_once_with("example.com", 443, 1.5, b"hello", False)
+
+    def test_nc_udp_flag_is_passed_through(self):
+        with mock.patch.object(bg.ByteGrylls, "netcat_client") as mocked:
+            self._run_main(["nc", "example.com", "53", "-u"])
+        self.assertTrue(mocked.call_args.args[4])
+
+    def test_listen_dispatches_parsed_args(self):
+        with mock.patch.object(bg.ByteGrylls, "netcat_listen") as mocked:
+            self._run_main(["listen", "0.0.0.0", "4444", "-u"])
+        mocked.assert_called_once_with("0.0.0.0", 4444, True)
+
+    def test_scan_parses_port_ranges_before_dispatch(self):
+        with mock.patch.object(bg.ByteGrylls, "port_scan") as mocked:
+            self._run_main(["scan", "10.0.0.5", "22,80,1000-1002", "-w", "10"])
+        mocked.assert_called_once_with("10.0.0.5", [22, 80, 1000, 1001, 1002], 1.0, 10)
+
+    def test_dns_reverse_flag_maps_to_ptr_record_type(self):
+        with mock.patch.object(bg.ByteGrylls, "dns_query") as mocked:
+            self._run_main(["dns", "8.8.8.8", "-x"])
+        mocked.assert_called_once_with("8.8.8.8", "8.8.8.8", 3.0, "PTR")
+
+    def test_dns_ipv6_flag_maps_to_aaaa_record_type(self):
+        with mock.patch.object(bg.ByteGrylls, "dns_query") as mocked:
+            self._run_main(["dns", "example.com", "-6"])
+        mocked.assert_called_once_with("example.com", "8.8.8.8", 3.0, "AAAA")
+
+    def test_ping_dispatches_parsed_args(self):
+        with mock.patch.object(bg.ByteGrylls, "ping") as mocked:
+            self._run_main(["ping", "8.8.8.8", "-c", "2", "-6"])
+        mocked.assert_called_once_with("8.8.8.8", 2, 2.0, True)
+
+    def test_traceroute_dispatches_parsed_args(self):
+        with mock.patch.object(bg.ByteGrylls, "traceroute") as mocked:
+            self._run_main(["traceroute", "8.8.8.8", "-m", "5"])
+        mocked.assert_called_once_with("8.8.8.8", 5, 2.0, False)
+
+    def test_invalid_port_exits_with_usage_error(self):
+        with captured_stdout(), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                self._run_main(["nc", "1.1.1.1", "99999"])
+        self.assertNotEqual(ctx.exception.code, 0)
+
+    def test_nc_falls_back_to_piped_stdin(self):
+        # sys.stdin.buffer is a read-only property on the real stdin object, so the whole
+        # sys.stdin reference is swapped out rather than patching its attributes individually.
+        fake_stdin = mock.Mock()
+        fake_stdin.isatty.return_value = False
+        fake_stdin.buffer = io.BytesIO(b"piped-bytes")
+        with mock.patch.object(bg.ByteGrylls, "netcat_client") as mocked, \
+             mock.patch.object(bg.sys, "stdin", fake_stdin), \
+             mock.patch.object(bg.sys, "argv", ["ByteGrylls.py", "nc", "1.1.1.1", "80"]):
+            bg.main()
+        mocked.assert_called_once_with("1.1.1.1", 80, 3.0, b"piped-bytes", False)
+
+
+class TestPortScan(unittest.TestCase):
+    def test_reports_open_and_closed_ports(self):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        open_port = srv.getsockname()[1]
+
+        closed_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed_srv.bind(("127.0.0.1", 0))
+        closed_port = closed_srv.getsockname()[1]
+        closed_srv.close()
+
+        try:
+            with captured_stdout() as out:
+                ByteGrylls.port_scan("127.0.0.1", [open_port, closed_port], timeout=0.5)
+        finally:
+            srv.close()
+
+        output = out.getvalue()
+        self.assertIn(f"[+] {open_port}/tcp open", output)
+        self.assertNotIn(f"[+] {closed_port}/tcp open", output)
+        self.assertIn(f"1/2 open -> {open_port}", output)
+
+
+class TestParsePorts(unittest.TestCase):
+    def test_parses_comma_list(self):
+        self.assertEqual(_parse_ports("22,80,443"), [22, 80, 443])
+
+    def test_parses_range(self):
+        self.assertEqual(_parse_ports("1000-1003"), [1000, 1001, 1002, 1003])
+
+    def test_parses_mixed_and_dedupes(self):
+        self.assertEqual(_parse_ports("22,20-22,80"), [22, 20, 21, 80])
+
+    def test_rejects_inverted_range(self):
+        with self.assertRaises(Exception):
+            _parse_ports("100-50")
+
+    def test_rejects_empty(self):
+        with self.assertRaises(Exception):
+            _parse_ports("")
 
 
 if __name__ == "__main__":

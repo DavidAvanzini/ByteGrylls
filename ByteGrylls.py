@@ -5,6 +5,7 @@ No external dependencies. Powered strictly by Python 3 standard library.
 """
 
 import argparse
+import concurrent.futures
 import os
 import select
 import socket
@@ -12,7 +13,7 @@ import struct
 import sys
 import time
 
-__version__ = "1.1.0"
+__version__ = "1.2.1"
 
 
 class ByteGrylls:
@@ -24,8 +25,40 @@ class ByteGrylls:
     # --- 1. NETCAT & PORT TESTING ---
 
     @staticmethod
-    def netcat_client(host: str, port: int, timeout: float = 3.0, data: bytes = None) -> bool:
-        """Connects to a remote TCP port, optionally sending data and printing any reply (Netcat client mode)."""
+    def netcat_client(host: str, port: int, timeout: float = 3.0, data: bytes = None, udp: bool = False) -> bool:
+        """Connects to a remote TCP port, or sends a UDP datagram, optionally sending data and printing any reply (Netcat client mode)."""
+        if udp:
+            print(f"[*] Sending UDP datagram to {host}:{port}...")
+            start_time = time.time()
+            try:
+                dest_ip, family = ByteGrylls._resolve(host)
+                with socket.socket(family, socket.SOCK_DGRAM) as s:
+                    s.settimeout(timeout)
+                    dest_addr = (dest_ip, port, 0, 0) if family == socket.AF_INET6 else (dest_ip, port)
+                    # Connecting a UDP socket lets a subsequent recv() surface ECONNREFUSED if the
+                    # kernel sees an ICMP Port Unreachable come back, giving a real "closed" signal.
+                    s.connect(dest_addr)
+                    s.send(data or b"")
+                    elapsed = (time.time() - start_time) * 1000
+                    print(f"[+] Sent {len(data or b'')} byte(s) to {host}:{port} in {elapsed:.2f} ms")
+                    try:
+                        reply = s.recv(4096)
+                        if reply:
+                            print(f"[Received Data]: {reply.decode(errors='replace')}")
+                    except socket.timeout:
+                        print("[*] No reply received (UDP is connectionless - open and filtered ports look identical without one).")
+                    except ConnectionError:
+                        # Linux surfaces this as ConnectionRefusedError; Windows surfaces the same
+                        # ICMP Port Unreachable as ConnectionResetError - both mean "closed".
+                        print(f"[-] {host}:{port} appears closed (ICMP port unreachable received).")
+                        return False
+                return True
+            except socket.gaierror:
+                print(f"[-] Cannot resolve host: {host}")
+            except Exception as e:
+                print(f"[-] UDP send error: {e}")
+            return False
+
         print(f"[*] Connecting to TCP {host}:{port}...")
         start_time = time.time()
         try:
@@ -52,16 +85,31 @@ class ByteGrylls:
         return False
 
     @staticmethod
-    def netcat_listen(host: str, port: int):
-        """Opens a local TCP socket and listens for incoming connections (Netcat server mode)."""
-        print(f"[*] Binding TCP socket listener on {host}:{port}...", flush=True)
+    def netcat_listen(host: str, port: int, udp: bool = False):
+        """Opens a local TCP or UDP socket and listens for incoming data (Netcat server mode)."""
+        proto = "UDP" if udp else "TCP"
+        print(f"[*] Binding {proto} socket listener on {host}:{port}...", flush=True)
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            sock_type = socket.SOCK_DGRAM if udp else socket.SOCK_STREAM
+            with socket.socket(socket.AF_INET, sock_type) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((host, port))
-                s.listen(5)
                 # Short timeout allows Python to intercept KeyboardInterrupt on PowerShell/Windows
                 s.settimeout(1.0)
+
+                if udp:
+                    print("[+] Listening for incoming datagrams... (Press Ctrl+C to abort)", flush=True)
+                    while True:
+                        try:
+                            dgram, addr = s.recvfrom(4096)
+                        except socket.timeout:
+                            continue
+                        print(f"[+] Datagram received from {addr[0]}:{addr[1]}", flush=True)
+                        if dgram:
+                            print(f"[Received Data]: {dgram.decode(errors='replace')}", flush=True)
+                    return
+
+                s.listen(5)
                 print("[+] Listening for incoming connections... (Press Ctrl+C to abort)", flush=True)
 
                 while True:
@@ -111,10 +159,33 @@ class ByteGrylls:
         return ".".join(labels), (jumped_from if jumped_from is not None else offset)
 
     @staticmethod
+    def _reverse_dns_name(ip: str) -> str:
+        """Builds the in-addr.arpa/ip6.arpa QNAME used for a PTR (reverse DNS) query."""
+        try:
+            packed = socket.inet_pton(socket.AF_INET, ip)
+            return ".".join(str(b) for b in reversed(packed)) + ".in-addr.arpa"
+        except OSError:
+            packed = socket.inet_pton(socket.AF_INET6, ip)
+            nibbles = []
+            for byte in reversed(packed):
+                nibbles.append(f"{byte & 0xF:x}")
+                nibbles.append(f"{byte >> 4:x}")
+            return ".".join(nibbles) + ".ip6.arpa"
+
+    @staticmethod
     def dns_query(hostname: str, dns_server: str = "8.8.8.8", timeout: float = 3.0, record_type: str = "A"):
-        """Performs a raw UDP DNS query (A or AAAA) without third-party DNS libraries."""
-        qtype_val = 28 if record_type == "AAAA" else 1
-        print(f"[*] Querying DNS record {record_type} for '{hostname}' via server {dns_server}...")
+        """Performs a raw UDP DNS query (A, AAAA, or PTR) without third-party DNS libraries."""
+        qtype_val = {"A": 1, "AAAA": 28, "PTR": 12}[record_type]
+        if record_type == "PTR":
+            try:
+                query_name = ByteGrylls._reverse_dns_name(hostname)
+            except OSError:
+                print(f"[-] '{hostname}' is not a valid IPv4 or IPv6 address for a PTR query.")
+                return None
+            print(f"[*] Querying DNS record PTR for '{hostname}' ({query_name}) via server {dns_server}...")
+        else:
+            query_name = hostname
+            print(f"[*] Querying DNS record {record_type} for '{hostname}' via server {dns_server}...")
 
         # Construct DNS Header (12 bytes)
         # Transaction ID, Flags (Standard query with recursion), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
@@ -123,7 +194,7 @@ class ByteGrylls:
         header = struct.pack("!HHHHHH", transaction_id, flags, 1, 0, 0, 0)
 
         # Construct Question Section (qname + qtype + qclass)
-        qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in hostname.split(".")) + b"\x00"
+        qname = b"".join(bytes([len(part)]) + part.encode("ascii") for part in query_name.split(".")) + b"\x00"
         qtype = struct.pack("!H", qtype_val)
         qclass = struct.pack("!H", 1)  # Class IN (Internet)
 
@@ -146,9 +217,9 @@ class ByteGrylls:
                     print(f"[-] DNS server returned 0 {record_type}-records for {hostname}.")
                     return None
 
-                # Walk past the echoed question, then each answer RR, to find a matching A/AAAA
-                # record rather than assuming it's the last 4 bytes of the packet - real responses
-                # commonly interleave CNAME/OPT records before or instead of the record we want.
+                # Walk past the echoed question, then each answer RR, to find a matching record
+                # rather than assuming it's at a fixed offset - real responses commonly interleave
+                # CNAME/OPT records before or instead of the record we want.
                 offset = 12
                 _, offset = ByteGrylls._parse_dns_name(response, offset)
                 offset += 4  # skip QTYPE + QCLASS
@@ -158,13 +229,16 @@ class ByteGrylls:
                     _, offset = ByteGrylls._parse_dns_name(response, offset)
                     rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", response[offset:offset + 10])
                     offset += 10
-                    rdata = response[offset:offset + rdlength]
+                    rdata_start = offset
                     offset += rdlength
                     if resolved is None and rclass == 1:
                         if rtype == 1 and rdlength == 4:
-                            resolved = socket.inet_ntoa(rdata)
+                            resolved = socket.inet_ntoa(response[rdata_start:offset])
                         elif rtype == 28 and rdlength == 16:
-                            resolved = socket.inet_ntop(socket.AF_INET6, rdata)
+                            resolved = socket.inet_ntop(socket.AF_INET6, response[rdata_start:offset])
+                        elif rtype == 12:
+                            # PTR rdata is itself a (possibly compressed) DNS name.
+                            resolved, _ = ByteGrylls._parse_dns_name(response, rdata_start)
 
                 if resolved:
                     print(f"[+] Resolved: {hostname} -> {resolved} ({elapsed:.2f} ms)")
@@ -244,13 +318,13 @@ class ByteGrylls:
                 for i in range(count):
                     sequence = i + 1
 
-                    header = struct.pack("bbHHh", echo_request_type, 0, 0, icmp_id, sequence)
+                    header = struct.pack("BBHHh", echo_request_type, 0, 0, icmp_id, sequence)
                     data = struct.pack("d", time.time())
                     if not is_ipv6:
                         # ICMPv6 checksums are computed by the kernel from the IPv6 pseudo-header;
                         # ICMPv4 has no such header, so it must be computed here.
                         chksum = self._checksum(header + data)
-                        header = struct.pack("bbHHh", echo_request_type, 0, socket.htons(chksum), icmp_id, sequence)
+                        header = struct.pack("BBHHh", echo_request_type, 0, socket.htons(chksum), icmp_id, sequence)
                     packet = header + data
 
                     sent += 1
@@ -273,7 +347,7 @@ class ByteGrylls:
                         icmp_header = recv_packet[icmp_header_offset:icmp_header_offset + 8]
                         if len(icmp_header) < 8:
                             continue
-                        type_val, _, _, resp_id, resp_seq = struct.unpack("bbHHh", icmp_header)
+                        type_val, _, _, resp_id, resp_seq = struct.unpack("BBHHh", icmp_header)
                         if type_val != echo_reply_type or resp_id != icmp_id or resp_seq != sequence:
                             continue  # unrelated ICMP traffic on the host - keep waiting for our own reply
 
@@ -340,11 +414,11 @@ class ByteGrylls:
                     send_socket = socket.socket(family, socket.SOCK_RAW, icmp_proto)
                     send_socket.setsockopt(ttl_level, ttl_opt, ttl)
 
-                    header = struct.pack("bbHHh", echo_request_type, 0, 0, icmp_id, ttl)
+                    header = struct.pack("BBHHh", echo_request_type, 0, 0, icmp_id, ttl)
                     data = struct.pack("d", time.time())
                     if not is_ipv6:
                         chksum = self._checksum(header + data)
-                        header = struct.pack("bbHHh", echo_request_type, 0, socket.htons(chksum), icmp_id, ttl)
+                        header = struct.pack("BBHHh", echo_request_type, 0, socket.htons(chksum), icmp_id, ttl)
                     packet = header + data
 
                     start_time = time.time()
@@ -369,7 +443,7 @@ class ByteGrylls:
                             icmp_header = recv_packet[icmp_header_offset:icmp_header_offset + 8]
                             if len(icmp_header) < 8:
                                 continue
-                            _, _, _, resp_id, resp_seq = struct.unpack("bbHHh", icmp_header)
+                            _, _, _, resp_id, resp_seq = struct.unpack("BBHHh", icmp_header)
                             if resp_id != icmp_id or resp_seq != ttl:
                                 continue  # unrelated ICMP traffic - keep waiting for our own probe's reply
                             hop_addr, reached = curr_addr[0], True
@@ -389,7 +463,7 @@ class ByteGrylls:
                             inner_header = recv_packet[inner_icmp_offset:inner_icmp_offset + 8]
                             if len(inner_header) < 8:
                                 continue
-                            _, _, _, resp_id, resp_seq = struct.unpack("bbHHh", inner_header)
+                            _, _, _, resp_id, resp_seq = struct.unpack("BBHHh", inner_header)
                             if resp_id != icmp_id or resp_seq != ttl:
                                 continue  # unrelated ICMP traffic - keep waiting for our own probe's reply
                             hop_addr = curr_addr[0]
@@ -424,6 +498,36 @@ class ByteGrylls:
         except KeyboardInterrupt:
             print("\n[*] Traceroute aborted by user.")
 
+    # --- 6. PORT SCANNER ---
+
+    @staticmethod
+    def port_scan(host: str, ports, timeout: float = 1.0, max_workers: int = 100):
+        """Sweeps a list of TCP ports on a host concurrently, reporting which are open."""
+        print(f"[*] Scanning TCP {host} across {len(ports)} port(s)...")
+
+        def _probe(port):
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    return True
+            except OSError:
+                return False
+
+        open_ports = []
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(ports))) as pool:
+                futures = {pool.submit(_probe, port): port for port in ports}
+                for future in concurrent.futures.as_completed(futures):
+                    port = futures[future]
+                    if future.result():
+                        print(f"[+] {port}/tcp open")
+                        open_ports.append(port)
+        except KeyboardInterrupt:
+            print("\n[*] Scan aborted by user.")
+
+        open_ports.sort()
+        summary = f" -> {', '.join(str(p) for p in open_ports)}" if open_ports else ""
+        print(f"\n[*] Scan complete: {len(open_ports)}/{len(ports)} open{summary}")
+
 
 # --- CLI INTERFACE WITH CONTEXTUAL HELP ---
 
@@ -438,6 +542,32 @@ def _valid_port(value: str) -> int:
     return port
 
 
+def _parse_ports(value: str) -> list:
+    """argparse type validator: parses a comma-separated list of ports and/or dash ranges (e.g. '22,80,1000-1010')."""
+    ports = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, _, end_s = part.partition("-")
+            start, end = _valid_port(start_s), _valid_port(end_s)
+            if start > end:
+                raise argparse.ArgumentTypeError(f"invalid port range: '{part}' (start must be <= end)")
+            ports.extend(range(start, end + 1))
+        else:
+            ports.append(_valid_port(part))
+    if not ports:
+        raise argparse.ArgumentTypeError("no ports specified")
+    seen = set()
+    unique_ports = []
+    for p in ports:
+        if p not in seen:
+            seen.add(p)
+            unique_ports.append(p)
+    return unique_ports
+
+
 def main():
     # Force line-buffered stdout so log lines (e.g. "listen" connections) appear
     # immediately instead of waiting on Python's block-buffering in PowerShell/Windows.
@@ -450,9 +580,14 @@ def main():
         epilog="Examples:\n"
                "  python3 ByteGrylls.py nc 1.1.1.1 80\n"
                "  python3 ByteGrylls.py nc 1.1.1.1 80 -d \"GET / HTTP/1.0\\r\\n\\r\\n\"\n"
+               "  python3 ByteGrylls.py nc 8.8.8.8 53 -u -d \"ping\"\n"
                "  python3 ByteGrylls.py listen 0.0.0.0 4444\n"
+               "  python3 ByteGrylls.py listen 0.0.0.0 5353 -u\n"
                "  python3 ByteGrylls.py dns example.com --server 8.8.8.8\n"
                "  python3 ByteGrylls.py dns example.com -6\n"
+               "  python3 ByteGrylls.py dns 8.8.8.8 -x\n"
+               "  python3 ByteGrylls.py scan 10.0.0.5 22,80,443\n"
+               "  python3 ByteGrylls.py scan 10.0.0.5 1-1024 -t 0.5\n"
                "  sudo python3 ByteGrylls.py ping google.com -c 5\n"
                "  sudo python3 ByteGrylls.py traceroute 8.8.8.8 -m 15\n\n"
                "Author: David Avanzini\n",
@@ -463,24 +598,36 @@ def main():
     subparsers = parser.add_subparsers(dest="command", help="Available diagnostic commands")
 
     # Netcat Client Subcommand
-    nc_parser = subparsers.add_parser("nc", help="Test TCP port connection (Netcat client mode)")
+    nc_parser = subparsers.add_parser("nc", help="Test TCP/UDP port connection (Netcat client mode)")
     nc_parser.add_argument("host", type=str, help="Target host IPv4 or domain name")
-    nc_parser.add_argument("port", type=_valid_port, help="Target TCP port number (1-65535)")
+    nc_parser.add_argument("port", type=_valid_port, help="Target port number (1-65535)")
     nc_parser.add_argument("-t", "--timeout", type=float, default=3.0, help="Connection timeout in seconds (default: 3.0)")
     nc_parser.add_argument("-d", "--data", type=str, default=None,
                             help="Literal text to send after connecting (defaults to piped stdin, if any)")
+    nc_parser.add_argument("-u", "--udp", action="store_true", help="Use UDP instead of TCP")
 
     # Netcat Listen Subcommand
-    listen_parser = subparsers.add_parser("listen", help="Open a local TCP socket listener (Netcat server mode)")
+    listen_parser = subparsers.add_parser("listen", help="Open a local TCP/UDP socket listener (Netcat server mode)")
     listen_parser.add_argument("host", type=str, nargs="?", default="0.0.0.0", help="Binding IP address (default: 0.0.0.0)")
-    listen_parser.add_argument("port", type=_valid_port, help="Listening TCP port number (1-65535)")
+    listen_parser.add_argument("port", type=_valid_port, help="Listening port number (1-65535)")
+    listen_parser.add_argument("-u", "--udp", action="store_true", help="Use UDP instead of TCP")
 
     # DNS Query Subcommand
     dns_parser = subparsers.add_parser("dns", help="Perform native DNS lookup via UDP")
-    dns_parser.add_argument("domain", type=str, help="Domain name to resolve")
+    dns_parser.add_argument("domain", type=str, help="Domain name to resolve (or IP address with -x/--reverse)")
     dns_parser.add_argument("-s", "--server", type=str, default="8.8.8.8", help="DNS server IPv4 address (default: 8.8.8.8)")
     dns_parser.add_argument("-t", "--timeout", type=float, default=3.0, help="Query timeout in seconds (default: 3.0)")
     dns_parser.add_argument("-6", "--ipv6", action="store_true", help="Query AAAA (IPv6) instead of A (IPv4)")
+    dns_parser.add_argument("-x", "--reverse", action="store_true",
+                             help="Reverse lookup: treat the argument as an IP and query its PTR record")
+
+    # Port Scanner Subcommand
+    scan_parser = subparsers.add_parser("scan", help="Scan a range of TCP ports on a host (Port scanner mode)")
+    scan_parser.add_argument("host", type=str, help="Target host IPv4/IPv6 or domain name")
+    scan_parser.add_argument("ports", type=_parse_ports,
+                              help="Ports to scan: comma-separated list and/or ranges, e.g. '22,80,443' or '1-1024'")
+    scan_parser.add_argument("-t", "--timeout", type=float, default=1.0, help="Per-port connection timeout in seconds (default: 1.0)")
+    scan_parser.add_argument("-w", "--workers", type=int, default=100, help="Maximum concurrent probes (default: 100)")
 
     # ICMP Ping Subcommand
     ping_parser = subparsers.add_parser("ping", help="Send ICMP Echo Requests (Requires Root/Sudo)")
@@ -512,11 +659,14 @@ def main():
                 data = sys.stdin.buffer.read()
             else:
                 data = None
-            tool.netcat_client(args.host, args.port, args.timeout, data)
+            tool.netcat_client(args.host, args.port, args.timeout, data, args.udp)
         elif args.command == "listen":
-            tool.netcat_listen(args.host, args.port)
+            tool.netcat_listen(args.host, args.port, args.udp)
         elif args.command == "dns":
-            tool.dns_query(args.domain, args.server, args.timeout, "AAAA" if args.ipv6 else "A")
+            record_type = "PTR" if args.reverse else ("AAAA" if args.ipv6 else "A")
+            tool.dns_query(args.domain, args.server, args.timeout, record_type)
+        elif args.command == "scan":
+            tool.port_scan(args.host, args.ports, args.timeout, args.workers)
         elif args.command == "ping":
             tool.ping(args.host, args.count, args.timeout, args.ipv6)
         elif args.command == "traceroute":
